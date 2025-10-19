@@ -10,6 +10,7 @@ import zipfile
 import tarfile
 import shutil
 from dotenv import load_dotenv
+import urllib.parse
 
 # --- FFmpeg Setup ---
 def setup_ffmpeg():
@@ -110,6 +111,8 @@ class MusicBot(commands.Cog):
         self.ffmpeg_executable = ffmpeg_executable
         self.voice_client = None
         self.current_song = None
+        self.song_queue = []
+        self.loop = False
 
     async def cleanup(self, filename):
         try:
@@ -119,18 +122,54 @@ class MusicBot(commands.Cog):
         except Exception as e:
             print(f"[ERROR] Error during cleanup: {e}")
 
-    async def after_playback(self, e, filename):
-        await self.cleanup(filename)
+    async def after_playback(self, e):
         if e:
             print(f'[ERROR] Player error: {e}')
+
+        if self.current_song and not self.loop:
+            await self.cleanup(self.current_song['filename'])
+
+        if self.loop and self.current_song:
+            self.song_queue.insert(0, self.current_song)
+
+        if self.song_queue:
+            next_song_data = self.song_queue.pop(0)
+            await self.play_next_song(next_song_data)
+        else:
+            self.current_song = None
+            if self.voice_client:
+                await asyncio.sleep(5) # Wait a bit before disconnecting
+                if self.voice_client and not self.voice_client.is_playing():
+                    await self.voice_client.disconnect()
+                    self.voice_client = None
+
+    async def play_next_song(self, song_data):
+        expected_filename = song_data["filename"]
+        title = song_data["title"]
+        duration = song_data["duration"]
+        
+        if not os.path.exists(expected_filename):
+            print(f"[ERROR] File not found for playback: {expected_filename}")
+            # Handle this case, maybe try redownloading or just skip
+            await self.after_playback(None) # Try next song
             return
 
-        await asyncio.sleep(2)
-        if self.voice_client and not self.voice_client.is_playing():
-            await self.voice_client.disconnect()
-            self.voice_client = None
+        print(f"[DEBUG] Starting playback of: {expected_filename}")
+        audio_source = discord.FFmpegPCMAudio(expected_filename, executable=self.ffmpeg_executable)
+        
+        self.voice_client.play(audio_source, after=lambda e: self.bot.loop.create_task(self.after_playback(e)))
+        self.current_song = song_data
 
-    @commands.hybrid_command(name='play', description='Воспроизвести музыку с YouTube')
+        # This part is tricky because we don't have the original context `ctx`
+        # We can't send a message to the channel where the command was invoked.
+        # A common solution is to save the channel ID and fetch it later.
+        # For now, we'll just print to console.
+        minutes, seconds = divmod(duration, 60)
+        duration_str = f"{minutes}:{seconds:02d}" if duration > 0 else "Неизвестно"
+        print(f"🎵 Now playing: {title} | Duration: {duration_str}")
+
+
+    @commands.hybrid_command(name='play', description='Воспроизвести музыку с YouTube или добавить в очередь')
     async def play_music(self, ctx, *, query: str):
         print(f"[DEBUG] 'play' command invoked by {ctx.author} with query: \"{query}\"")
         if not ctx.author.voice:
@@ -142,27 +181,26 @@ class MusicBot(commands.Cog):
             await ctx.send("❌ У меня нет прав для подключения или воспроизведения аудио в этом канале!")
             return
 
+        loading_msg = await ctx.send(f"🔄 Обработка запроса `{query}`...")
+
         try:
-            if self.voice_client is None or not self.voice_client.is_connected():
-                print(f"[DEBUG] Connecting to voice channel: {voice_channel.name}")
-                self.voice_client = await voice_channel.connect()
-            elif self.voice_client.channel != voice_channel:
-                print(f"[DEBUG] Moving to voice channel: {voice_channel.name}")
-                await self.voice_client.move_to(voice_channel)
-
-            loading_msg = await ctx.send(f"🔄 Обработка запроса `{query}`...")
-
             os.makedirs('downloads', exist_ok=True)
-            
             local_ydl_opts = ydl_opts.copy()
             local_ydl_opts['ffmpeg_location'] = os.path.dirname(self.ffmpeg_executable)
 
             with youtube_dl.YoutubeDL(local_ydl_opts) as ydl:
                 try:
                     is_url = query.strip().startswith('http')
-                    search_query = query if is_url else f"ytsearch:{query}"
-                    print(f"[DEBUG] Performing yt-dlp search with: '{search_query}'")
-                    
+                    search_query = query
+
+                    if is_url and 'youtube.com' in query and 'search_query' in query:
+                        parsed_url = urllib.parse.urlparse(query)
+                        search_query = urllib.parse.parse_qs(parsed_url.query)['search_query'][0]
+                        print(f"[DEBUG] Extracted search query from URL: '{search_query}'")
+                        search_query = f"ytsearch:{search_query}"
+                    elif not is_url:
+                        search_query = f"ytsearch:{query}"
+
                     info = ydl.extract_info(search_query, download=False)
 
                     if 'entries' in info:
@@ -172,44 +210,46 @@ class MusicBot(commands.Cog):
                         video_info = info['entries'][0]
                     else:
                         video_info = info
-
+                    
                     video_id = video_info['id']
                     title = video_info.get('title', 'Неизвестная песня')
                     duration = video_info.get('duration', 0)
                     webpage_url = video_info['webpage_url']
-                    print(f"[DEBUG] Found video: {title} ({webpage_url})")
-
                     expected_filename = os.path.join('downloads', f"{video_id}.mp3")
+
+                    song_data = {
+                        "filename": expected_filename,
+                        "title": title,
+                        "duration": duration,
+                        "webpage_url": webpage_url,
+                        "requester": ctx.author.mention
+                    }
 
                     if not os.path.exists(expected_filename):
                         await loading_msg.edit(content=f"📥 Загружаю `{title}`...")
                         ydl.download([webpage_url])
-                        print(f"[DEBUG] Downloaded to: {expected_filename}")
 
                 except Exception as e:
                     print(f"[ERROR] Exception during yt-dlp processing: {e}")
                     await loading_msg.edit(content=f"❌ Ошибка при обработке запроса: {e}")
                     return
 
-            if not os.path.exists(expected_filename):
-                await loading_msg.edit(content="❌ Ошибка: Загруженный файл не найден после скачивания.")
-                return
-
-            if self.voice_client.is_playing():
-                self.voice_client.stop()
-
-            print(f"[DEBUG] Starting playback of: {expected_filename}")
-            audio_source = discord.FFmpegPCMAudio(expected_filename, executable=self.ffmpeg_executable)
-            
-            self.voice_client.play(audio_source, after=lambda e: self.bot.loop.create_task(self.after_playback(e, expected_filename)))
-            self.current_song = title
-
-            minutes, seconds = divmod(duration, 60)
-            duration_str = f"{minutes}:{seconds:02d}" if duration > 0 else "Неизвестно"
-
-            await loading_msg.edit(
-                content=f"🎵 **Сейчас играет:** {title}\n⏱️ **Длительность:** {duration_str}\n🔊 **Канал:** {voice_channel.name}"
-            )
+            if self.voice_client and self.voice_client.is_playing():
+                self.song_queue.append(song_data)
+                await loading_msg.edit(content=f"✅ **Добавлено в очередь:** {title}")
+            else:
+                if self.voice_client is None or not self.voice_client.is_connected():
+                    self.voice_client = await voice_channel.connect()
+                elif self.voice_client.channel != voice_channel:
+                    await self.voice_client.move_to(voice_channel)
+                
+                await self.play_next_song(song_data)
+                
+                minutes, seconds = divmod(duration, 60)
+                duration_str = f"{minutes}:{seconds:02d}" if duration > 0 else "Неизвестно"
+                await loading_msg.edit(
+                    content=f"🎵 **Сейчас играет:** {title}\n⏱️ **Длительность:** {duration_str}\n🔊 **Канал:** {voice_channel.name}"
+                )
 
         except Exception as e:
             import traceback
@@ -217,14 +257,19 @@ class MusicBot(commands.Cog):
             traceback.print_exc()
             await ctx.send(f"❌ Произошла ошибка: {str(e)}")
 
-    @commands.hybrid_command(name='stop', description='Остановить воспроизведение музыки')
+    @commands.hybrid_command(name='stop', description='Остановить воспроизведение и очистить очередь')
     async def stop_music(self, ctx):
         print(f"[DEBUG] 'stop' command invoked by {ctx.author}")
-        if self.voice_client and self.voice_client.is_playing():
+        if self.voice_client:
+            self.song_queue = []
+            self.loop = False
             self.voice_client.stop()
-            await ctx.send("⏹️ Воспроизведение остановлено!")
+            await self.voice_client.disconnect()
+            self.voice_client = None
+            self.current_song = None
+            await ctx.send("⏹️ Воспроизведение остановлено и очередь очищена!")
         else:
-            await ctx.send("❌ Музыка не воспроизводится!")
+            await ctx.send("❌ Бот не в голосовом канале!")
 
     @commands.hybrid_command(name='pause', description='Приостановить воспроизведение музыки')
     async def pause_music(self, ctx):
@@ -248,6 +293,8 @@ class MusicBot(commands.Cog):
     async def disconnect(self, ctx):
         print(f"[DEBUG] 'disconnect' command invoked by {ctx.author}")
         if self.voice_client:
+            self.song_queue = []
+            self.loop = False
             await self.voice_client.disconnect()
             self.voice_client = None
             self.current_song = None
@@ -259,9 +306,42 @@ class MusicBot(commands.Cog):
     async def now_playing(self, ctx):
         print(f"[DEBUG] 'nowplaying' command invoked by {ctx.author}")
         if self.current_song and self.voice_client and self.voice_client.is_playing():
-            await ctx.send(f"🎵 **Сейчас играет:** {self.current_song}")
+            title = self.current_song['title']
+            await ctx.send(f"🎵 **Сейчас играет:** {title}")
         else:
             await ctx.send("❌ Сейчас ничего не играет!")
+
+    @commands.hybrid_command(name='skip', description='Пропустить текущую песню')
+    async def skip(self, ctx):
+        print(f"[DEBUG] 'skip' command invoked by {ctx.author}")
+        if self.voice_client and self.voice_client.is_playing():
+            self.voice_client.stop()
+            await ctx.send("⏭️ Песня пропущена!")
+        else:
+            await ctx.send("❌ Нечего пропускать!")
+
+    @commands.hybrid_command(name='queue', description='Показать всю очередь песен', aliases=['list'])
+    async def queue(self, ctx):
+        print(f"[DEBUG] 'queue' command invoked by {ctx.author}")
+        if not self.song_queue:
+            await ctx.send("🎶 Очередь пуста!")
+            return
+
+        embed = discord.Embed(title="🎶 Очередь песен", color=discord.Color.blue())
+        
+        queue_list = ""
+        for i, song in enumerate(self.song_queue):
+            queue_list += f"{i+1}. {song['title']}\n"
+        
+        embed.description = queue_list
+
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name='clear', description='Очистить очередь песен')
+    async def clear(self, ctx):
+        print(f"[DEBUG] 'clear' command invoked by {ctx.author}")
+        self.song_queue = []
+        await ctx.send("🗑️ Очередь очищена!")
 
 async def setup(bot, ffmpeg_executable):
     await bot.add_cog(MusicBot(bot, ffmpeg_executable))
