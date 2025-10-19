@@ -105,6 +105,52 @@ ydl_opts = {
     'no_warnings': True,
 }
 
+class MusicControls(discord.ui.View):
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="⏯️", style=discord.ButtonStyle.secondary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.cog.voice_client.is_paused():
+            self.cog.voice_client.resume()
+            await interaction.response.send_message("▶️ Воспроизведение возобновлено!", ephemeral=True)
+        else:
+            self.cog.voice_client.pause()
+            await interaction.response.send_message("⏸️ Воспроизведение приостановлено!", ephemeral=True)
+
+    @discord.ui.button(label="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.cog.voice_client and self.cog.voice_client.is_playing():
+            self.cog.voice_client.stop()
+            await interaction.response.send_message("⏭️ Песня пропущена!", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Нечего пропускать!", ephemeral=True)
+
+    @discord.ui.button(label="⏮️", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await self.cog.previous_song(interaction)
+
+    @discord.ui.button(label="⏹️", style=discord.ButtonStyle.danger)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.cog.voice_client:
+            self.cog.song_queue = []
+            self.cog.loop = False
+            self.cog.voice_client.stop()
+            await self.cog.voice_client.disconnect()
+            self.cog.voice_client = None
+            self.cog.current_song = None
+            await interaction.response.send_message("⏹️ Воспроизведение остановлено и очередь очищена!", ephemeral=True)
+            if self.cog.now_playing_message:
+                try:
+                    await self.cog.now_playing_message.delete()
+                except discord.NotFound:
+                    pass
+        else:
+            await interaction.response.send_message("❌ Бот не в голосовом канале!", ephemeral=True)
+
+
 class MusicBot(commands.Cog):
     def __init__(self, bot, ffmpeg_executable):
         self.bot = bot
@@ -112,7 +158,10 @@ class MusicBot(commands.Cog):
         self.voice_client = None
         self.current_song = None
         self.song_queue = []
+        self.play_history = []
         self.loop = False
+        self.last_channel_id = None
+        self.now_playing_message = None
 
     async def cleanup(self, filename):
         try:
@@ -126,52 +175,73 @@ class MusicBot(commands.Cog):
         if e:
             print(f'[ERROR] Player error: {e}')
 
-        if self.current_song and not self.loop:
-            await self.cleanup(self.current_song['filename'])
+        if self.current_song:
+            if not self.loop:
+                await self.cleanup(self.current_song['filename'])
+            self.play_history.append(self.current_song)
 
         if self.loop and self.current_song:
             self.song_queue.insert(0, self.current_song)
 
-        if self.song_queue:
-            next_song_data = self.song_queue.pop(0)
-            await self.play_next_song(next_song_data)
-        else:
+        await self.play_next_song()
+
+    async def play_next_song(self):
+        if not self.song_queue:
             self.current_song = None
             if self.voice_client:
-                await asyncio.sleep(5) # Wait a bit before disconnecting
+                await asyncio.sleep(5)
                 if self.voice_client and not self.voice_client.is_playing():
                     await self.voice_client.disconnect()
                     self.voice_client = None
+            if self.now_playing_message:
+                try:
+                    await self.now_playing_message.delete()
+                except discord.NotFound:
+                    pass
+            return
 
-    async def play_next_song(self, song_data):
+        song_data = self.song_queue.pop(0)
+        self.current_song = song_data
+
         expected_filename = song_data["filename"]
         title = song_data["title"]
         duration = song_data["duration"]
         
         if not os.path.exists(expected_filename):
             print(f"[ERROR] File not found for playback: {expected_filename}")
-            # Handle this case, maybe try redownloading or just skip
-            await self.after_playback(None) # Try next song
-            return
+            try:
+                with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([song_data['webpage_url']])
+            except Exception as e:
+                print(f"[ERROR] Failed to re-download {title}: {e}")
+                await self.after_playback(None)
+                return
 
         print(f"[DEBUG] Starting playback of: {expected_filename}")
         audio_source = discord.FFmpegPCMAudio(expected_filename, executable=self.ffmpeg_executable)
         
         self.voice_client.play(audio_source, after=lambda e: self.bot.loop.create_task(self.after_playback(e)))
-        self.current_song = song_data
 
-        # This part is tricky because we don't have the original context `ctx`
-        # We can't send a message to the channel where the command was invoked.
-        # A common solution is to save the channel ID and fetch it later.
-        # For now, we'll just print to console.
-        minutes, seconds = divmod(duration, 60)
-        duration_str = f"{minutes}:{seconds:02d}" if duration > 0 else "Неизвестно"
-        print(f"🎵 Now playing: {title} | Duration: {duration_str}")
+        if self.last_channel_id:
+            channel = self.bot.get_channel(self.last_channel_id)
+            if channel:
+                minutes, seconds = divmod(duration, 60)
+                duration_str = f"{minutes}:{seconds:02d}" if duration > 0 else "Неизвестно"
+                embed = discord.Embed(title="🎵 Сейчас играет", description=f"[{title}]({song_data['webpage_url']})", color=discord.Color.blue())
+                embed.add_field(name="Длительность", value=duration_str)
+                embed.add_field(name="Запросил", value=song_data['requester'])
+                
+                if self.now_playing_message:
+                    try:
+                        await self.now_playing_message.delete()
+                    except discord.NotFound:
+                        pass
 
+                self.now_playing_message = await channel.send(embed=embed, view=MusicControls(self))
 
     @commands.hybrid_command(name='play', description='Воспроизвести музыку с YouTube или добавить в очередь')
     async def play_music(self, ctx, *, query: str):
-        print(f"[DEBUG] 'play' command invoked by {ctx.author} with query: \"{query}\"")
+        print(f"[DEBUG] 'play' command invoked by {ctx.author} with query: \"{query}\" ")
         if not ctx.author.voice:
             await ctx.send("❌ Вы должны находиться в голосовом канале!")
             return
@@ -233,6 +303,8 @@ class MusicBot(commands.Cog):
                     print(f"[ERROR] Exception during yt-dlp processing: {e}")
                     await loading_msg.edit(content=f"❌ Ошибка при обработке запроса: {e}")
                     return
+            
+            self.last_channel_id = ctx.channel.id
 
             if self.voice_client and self.voice_client.is_playing():
                 self.song_queue.append(song_data)
@@ -243,19 +315,34 @@ class MusicBot(commands.Cog):
                 elif self.voice_client.channel != voice_channel:
                     await self.voice_client.move_to(voice_channel)
                 
-                await self.play_next_song(song_data)
-                
-                minutes, seconds = divmod(duration, 60)
-                duration_str = f"{minutes}:{seconds:02d}" if duration > 0 else "Неизвестно"
-                await loading_msg.edit(
-                    content=f"🎵 **Сейчас играет:** {title}\n⏱️ **Длительность:** {duration_str}\n🔊 **Канал:** {voice_channel.name}"
-                )
+                self.song_queue.insert(0, song_data)
+                await self.play_next_song()
+                await loading_msg.delete()
 
         except Exception as e:
             import traceback
             print(f"[ERROR] General exception in play_music: {e}")
             traceback.print_exc()
             await ctx.send(f"❌ Произошла ошибка: {str(e)}")
+
+    async def previous_song(self, interaction: discord.Interaction):
+        if not self.play_history:
+            await interaction.followup.send("❌ Нет предыдущих песен в истории.", ephemeral=True)
+            return
+
+        if self.voice_client and self.voice_client.is_playing():
+            if self.current_song:
+                self.song_queue.insert(0, self.current_song)
+
+        previous_song = self.play_history.pop()
+        self.song_queue.insert(0, previous_song)
+
+        if self.voice_client and self.voice_client.is_playing():
+            self.voice_client.stop()
+        else:
+            await self.play_next_song()
+
+        await interaction.followup.send("⏮️ Воспроизвожу предыдущую песню!", ephemeral=True)
 
     @commands.hybrid_command(name='stop', description='Остановить воспроизведение и очистить очередь')
     async def stop_music(self, ctx):
@@ -268,6 +355,11 @@ class MusicBot(commands.Cog):
             self.voice_client = None
             self.current_song = None
             await ctx.send("⏹️ Воспроизведение остановлено и очередь очищена!")
+            if self.now_playing_message:
+                try:
+                    await self.now_playing_message.delete()
+                except discord.NotFound:
+                    pass
         else:
             await ctx.send("❌ Бот не в голосовом канале!")
 
@@ -299,6 +391,11 @@ class MusicBot(commands.Cog):
             self.voice_client = None
             self.current_song = None
             await ctx.send("🔌 Бот отключен от голосового канала!")
+            if self.now_playing_message:
+                try:
+                    await self.now_playing_message.delete()
+                except discord.NotFound:
+                    pass
         else:
             await ctx.send("❌ Бот не подключен к голосовому каналу!")
 
